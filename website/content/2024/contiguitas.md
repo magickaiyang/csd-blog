@@ -21,42 +21,46 @@ committee = [
 ]
 +++
 
-Applications access data in the memory using virtual addresses, but the virtual memory abstraction is not free. In fact, the unabating growth of the memory needs of emerging datacenter applications has exacerbated the scalability bottleneck of virtual memory. However, reducing the overhead of address translation relies on physical memory contiguity, which is in short supply. To address the problem, *Contiguitas* provides ample physical memory contiguity through the synergy of operating system memory management and architecture support. This blog post is adapted from a published [paper](https://dl.acm.org/doi/10.1145/3579371.3589079).
-
 # Introduction
+
+## Applications Use Virtual Memory
+
+Applications access their data in the memory using *virtual addresses*, which tell the hardware where to fetch or store a particular piece of data.
+Virtual addresses are mapped to *physical addresses* referencing the actual memory provided by the hardware (e.g., DRAM sticks) by the operating system (OS) in a manner that is transparent to applications. This abstraction is called *virtual memory*.
+
+Virtual memory provides many benefits. It supports isolation and protection as applications must access memory using the virtual memory abstraction that is controlled by the OS. Therefore, an application cannot access memory owned by another application, and an application cannot write to memory that is supposed to be read-only.
+Furthremore, virtual memory introduces flexibility into memory management. For example, multiple applications can coexist on a system without prior coordination on which part of the memory each can use, because virtual memory gives a per-application view of the memory.
+There are other advanced use cases of virtual memory not covered here.
 
 ## The Worsening Virtual Memory Bottleneck
 
-Memory capacity has increased dramatically over the last few decades, increasing from dozens of kilobytes to terabytes, yet modern operating systems have throughout stuck with a small base page size that is a relic from earlier times.
-This divergence has resulted in excessive management overhead for memory-intensive applications. 
-In particular, virtual memory implementations are plagued by expansive page table trees to cover the increasing memory usage by applications, and to cache the ever-larger page tables, a corresponding appetite for hardware Translation Lookaside Buffers (TLB) capacity that is difficult to satiate.
-Even with hardware innovations such as larger and multi-level TLB, applications today suffer a substantial performance penalty due to TLB misses. 
+However, the virtual memory abstraction is not free. Every time a virtual address is translated into a physical address, *page tables*, the data structures set up by the OS to map the addresses, must be accessed, creating an overhead.
+To mitigate the overhead, the hardware contains a cache for the frequently used page tables, called the Translation Lookaside Buffers (TLB).
+Unfortunately, the unabating growth of the memory needs of applications 
+means that larger page tables are needed, making the TLB less effective and creating a virtual memory bottleneck.
+Concretely, memory capacity has increased dramatically over the last few decades, increasing from dozens of kilobytes to terabytes, but the TLB is size-contrained due to limitations of hardware cache scaling.
+This divergence has resulted in excessive virtual memory overhead for memory-intensive applications. 
 
-Case in point, as shown in the figure below, servers at Meta have their memory capacity increased by almost eight times over a few hardware generations. However, the number of TLB entries remains stagnant, leading to minuscule and shrinking TLB coverage.
+Case in point, as shown in the figure below, servers at Meta have their memory capacity (shown by the blue line and the left y axis in the figure) increased by almost eight times over a few hardware generations (x axis). However, the number of TLB entries remains stagnant, leading to minuscule and shrinking TLB coverage (the orange lines and the right y axis).
 
 ![Memory and TLB coverage of computing hardware across generations.](./bg-mem-tlb.pdf)
 
 Google's profiling further revealed that approximately 
 20% of CPU cycles in their datacenters are stalled on TLB misses [1].
 
-Unfortunately, this problem is only bound to get worse due to:  i) the inherent hardware limits of TLB size scaling, already surpassing L2 cache latencies, ii) terabyte-scale memory capacity through technologies like Compute Express Link (CXL),  iii) additional levels of page tables, and iv) the increase of memory-intensive applications such as those for graph processing, caching and scientific computing.
+Unfortunately, this problem is only bound to get worse due to: i) the inherent hardware limits of TLB size scaling, already surpassing L2 cache latencies, ii) terabyte-scale memory capacity through technologies like Compute Express Link (CXL),  iii) additional levels of page tables, and iv) the increase of memory-intensive applications such as those for graph processing, caching and scientific computing.
 
-## Most Solutions Rely on Memory Contiguity
+## Solutions Rely on Memory Contiguity
 
-A large body of prior research has focused on reducing the virtual memory overhead. Conceptually, we can separate prior work based on the amount of physical memory contiguity required and how it is exploited.
-
-On the one hand, earlier works propose leveraging physical memory contiguity to back the application dataset [2].
-These approaches create range-based translations by relying on large contiguous physical memory. However, they face the fundamental challenge that it is very hard to create multi-gigabyte contiguous physical address ranges to cover the complete application dataset.
-
-On the other hand, another line of research has explored alternative page table structures such as hashed page tables [3]. Such solutions aim to replace sequential multi-level page tables and drastically reduce the cost of page walks by accelerating page table accesses. Notably, they relax the physical memory contiguity requirements to apply not on the whole dataset, but only on the page table organization. However, they impose strict requirements for physical memory contiguity availability on the critical path of page table creation.
-
-Several other architectural extensions that implicitly rely on contiguity [4, 5] are hindered by the same fundamental challenge.
-
-Today's operating systems (OS), such as Linux, have mostly relied on 2MB Transparent Huge Pages (THP) that *opportunistically* provide 2MB pages to land performance improvements. Unfortunately in today's systems, finding physical contiguity even for 2MB pages is often hard due to memory fragmentation [6, 7]. THPs have also been under scrutiny due to performance implications such as latency spikes and memory bloating. Alternative approaches, such as userspace allocators, still rely on the OS to provide physical contiguity and larger mappings. In summary, physical memory contiguity is required to address the virtual memory bottleneck.
+Existing solutions to reduce the overhead of virtual memory rely on *memory contiguity*, ranges of memory that are either free or in-use by a single application.
+Fundamentally, they consider a contiguous range of memory as a single unit, therefore, reduces the number of TLB entries needed to cache the translations of a given amount of memory. Practically, some solutions map an entire application's dataset using memory contiguity [2], and some others use alternative virtual memory designs that require less memory contiguity for good performance [3, 4, 5].
 
 ## Memory Contiguity is Scarce in Datacenters
 
-We started with a detailed investigation of physical memory contiguity at hyperscale across Meta's datacenters. We sampled servers across the fleet and the memory fragmentation distribution is shown in the following figure.
+Memory contiguity tends to decrease over time as a system runs because the intervals between the allocation and the freeing of ranges of memory are non-uniform, causing in-use memory to be sandwiched between free memory. This phenomenon is called *memory fragmentaion*.
+
+There are many prior works hinting that memory contiguity is in low supply due to memory fragmentation [6,7].
+To test whether this is the case, we performed a detailed investigation of memory contiguity at hyperscale across Meta's datacenters. We sampled servers across the fleet and the memory fragmentation distribution is shown in the following figure.
 
 ![Contiguity availability as the percentage of free memory.](./bg-frag.pdf)
 
@@ -65,7 +69,8 @@ We see that 23% of servers do not even have physical memory contiguity for a sin
 Furthermore, our analysis shows that there is little to no correlation between memory contiguity and server uptime, with the Pearson correlation coefficient between server uptime and the number of free 2MB pages being only 0.00286.
 Pertinently, this means that fragmentation affects all servers. In practice, servers can quickly get heavily fragmented within the first hour after boot-up while the mean server uptime is days or weeks---turning memory fragmentation into a major challenge.
 
-Finally, our study exposes unmovable memory allocations as the root cause for the lack of physical memory contiguity. In particular, we identify several sources of unmovable allocations, including networking buffers, slab, filesystems, and page tables. 
+Finally, our study exposes unmovable memory allocations as the root cause for the lack of physical memory contiguity. Unmovable pages, as their name suggests, cannot be moved around to defragment the memory and recover memory contiguity.
+In particular, we identify several sources of unmovable allocations, including networking buffers, slab, filesystems, and page tables. 
 
 ## Our Work: Contiguitas
 
@@ -80,19 +85,15 @@ For the second problem, Contiguitas focuses on unmovable pages that cannot be mo
 Our experiments in Meta's production datacenters
 show that Contiguitas successfully confines unmovable allocations, leading to significant performance gains. Full-system simulations showcase the effectiveness of Contiguitas's hardware. We are currently in the process of upstreaming the software part of Contiguitas into Linux.
 
+This blog post is adapted from a published [paper](https://dl.acm.org/doi/10.1145/3579371.3589079).
+
 # Contiguitas Design
 
 The goal of Contiguitas is to provide ample physical memory contiguity by reducing memory fragmentation due to unmovable allocations.
-To that end, Contiguitas redesigns memory management in the OS to confine unmovable allocations and completely separate them from movable ones. 
-In addition, Contiguitas drastically reduces unmovable pages in datacenters.
-Specifically, Contiguitas introduces a set of hardware extensions in the LLC
-that enable the transparent migration of unmovable pages while in use.
-
-## Overview
 
 ![Contiguitas design overview.](./overview_main_v2.pdf)
 
-First, Contiguitas redesigns memory management in the OS to confine unmovable allocations and completely separate them from movable ones (Step 1), preventing unmovable allocations from scattering across the address space. Then, Contiguitas dynamically resizes regions in response to memory pressure (Step 2). Finally, Contiguitas drastically reduces unmovable pages through hardware extensions in the LLC that enable transparent migration of unmovable pages while in use (Step 3).
+To that end, Contiguitas first redesigns memory management in the OS to confine unmovable allocations and completely separate them from movable ones (Step 1), preventing unmovable allocations from scattering across the address space. Then, Contiguitas dynamically resizes regions in response to memory pressure (Step 2). Finally, Contiguitas drastically reduces unmovable pages through hardware extensions in the LLC that enable transparent migration of unmovable pages while in use (Step 3).
 
 ## Unmovable Confinement
 
@@ -102,7 +103,9 @@ Contiguitas is to strictly separate unmovable from movable allocations using two
 Allocations are confined in their respective region. Contiguitas categorizes the physical pages based on their addresses and keeps them on distinct free lists for each region. Memory in each region can only be allocated from pages in the free lists belonging to that region. When a page is freed, it is returned back to its respective list. This approach simplifies the critical path of allocations as the OS can quickly pick a free page while avoiding mixing different types of allocations.
 For allocations that are first allocated as movable but later become unmovable, Contiguitas migrates them to the unmovable region and marks them as unmovable. This approach avoids the dynamic pollution of the movable region and subsequent compaction failures.
 
-The crucial part in designing confinement is the sizing of the unmovable region. If it is too big, unused memory in the unmovable region is wasted while there is limited movable memory for the  applications, causing frequent reclaims, swapping, or even allocation failures. On the other hand, if the unmovable region is too small, it may fail unmovable allocations. Therefore, Contiguitas dynamically balances the sizes of the movable and unmovable regions while not negatively affecting application performance. There are three major challenge in dynamic resizing.
+## Dynamic Resizing
+
+The crucial part in achieving confinement is the sizing of the unmovable region. If it is too big, unused memory in the unmovable region is wasted while there is limited movable memory for the  applications, causing frequent reclaims, swapping, or even allocation failures. On the other hand, if the unmovable region is too small, it may fail unmovable allocations. Therefore, Contiguitas dynamically balances the sizes of the movable and unmovable regions while not negatively affecting application performance. There are three major challenge in dynamic resizing.
 
 ### Challenge 1: Putting Resizing Off the Critical Path
 
@@ -114,15 +117,15 @@ Contiguitas performs resizing off the critical path of memory allocation to avoi
 The second challenge is to decide when and how much to resize.
 Contiguitas introduces the concept of per-region memory pressure and extends Pressure Stall Information (PSI) [6] to track time wasted due to lack of free memory in the movable and unmovable region separately, which is then used to calculate the expansion/shrinking amount influenced by tunable parameters.
 
-### Challenge 3: Making Resizing Cheap
+### Challenge 3: Making Resizing Possible and Cheap
 
 The third challenge is to ease resizing and reduce data movement.
 Contiguitas introduces a bias to prefer physical pages further away from the region border. 
 Some unmovable allocations that are inherently long lived, e.g., kernel code pages, are safely placed by Contiguitas early on, at the end of the unmovable region that is farthest from the movable region. On the other hand, pages that are initially in the movable region and later on migrated to the unmovable region often exhibit short lifetimes.
-In general, Contiguitas prefers allocating pages away from the region border as long as sufficient free space is available.
-This approach increases the chance that resizing will be successful and need little data movement.
+In general, Contiguitas prefers allocating pages away from the region border as long as sufficient free space is available to avoid unmovable pages blocking resizing and to reduce the amount of data movement needed for resizing.
+Furthermore, for the unlikely case of unmovable pages blocking the reduction in size of the unmovable region, the hardware migration mechanism of Contiguitas can be utilized to move such pages away.
 
-## Hardware Migration of Unmovables
+## Hardware Migration of Unmovable Pages
 
 The second design principle guiding 
 Contiguitas is to drastically reduce the amount of unmovable allocations by turning them into movable ones. 
@@ -185,7 +188,7 @@ Overall, Contiguitas-HW does not negatively impact applications that do not bene
 
 # Conclusion and Impacts
 
-Contiguitas is a holistic solution that addresses the long-standing problem of memory contiguity in datacenters. Contiguitasis already having a major impact as it is in the process of being upstreamed to the Linux kernel [7], and Meta is actively working on deploying it in production. 
+Contiguitas is a holistic solution that addresses the long-standing problem of memory contiguity in datacenters. Contiguitas is in the process of being upstreamed to the Linux kernel [7], and Meta is actively working on deploying it in production. 
 
 # References
 
